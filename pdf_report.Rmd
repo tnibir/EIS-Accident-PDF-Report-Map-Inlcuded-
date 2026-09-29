@@ -1,0 +1,785 @@
+---
+title: "Spatial Analysis of Worker Accident Risk on Road Corridors in Bangladesh"
+subtitle: "Identification of accident-prone roads, localized clusters, and risk-reduction priorities"
+author: "Tasbiul Islam Nibir"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: true
+    keep_tex: false
+    latex_engine: pdflatex
+fontsize: 11pt
+geometry: margin=0.82in
+params:
+  risk_radius_m: 1000
+  project_data_dir: null
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+  - \usepackage{float}
+  - \usepackage{caption}
+  - \captionsetup{font=small,labelfont=bf}
+  - \renewcommand{\arraystretch}{1.18}
+  - \setlength{\tabcolsep}{4pt}
+  - \usepackage{xcolor}
+  - \definecolor{RiskRed}{HTML}{A51C30}
+  - \usepackage{fancyhdr}
+  - \setlength{\headheight}{14pt}
+  - \pagestyle{fancy}
+  - \fancyhead[L]{Worker Accident Risk-Zone Research Report}
+  - \fancyhead[R]{Tasbiul Islam Nibir}
+  - \fancyfoot[C]{\thepage}
+---
+
+```{r setup, include=FALSE}
+## Formatting
+# Reviewer note: this hidden setup block loads the mapping tools and establishes consistent print styling.
+# How it works: the report stops early if a required package is absent, avoiding an incomplete PDF.
+
+knitr::opts_chunk$set(
+  echo = FALSE, warning = FALSE, message = FALSE,
+  fig.align = "center", fig.pos = "htbp", dpi = 300,
+  fig.width = 7.2, fig.height = 5.2, out.width = "100%"
+)
+
+## Libraries
+required_packages <- c(
+  "rmarkdown", "sf", "dplyr", "readr", "ggplot2", "knitr",
+  "scales", "maptiles", "terra"
+)
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages)) stop("Install required packages: ", paste(missing_packages, collapse = ", "))
+
+library(sf)
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(knitr)
+library(scales)
+library(maptiles)
+library(terra)
+
+## Resolve paths from the location of this Rmd, not the caller's working directory.
+input_file <- knitr::current_input(dir = TRUE)
+if (is.null(input_file) || !nzchar(input_file)) input_file <- "pdf_report.Rmd"
+project_root <- normalizePath(dirname(input_file), winslash = "/", mustWork = TRUE)
+
+analysis_script <- file.path(project_root, "R", "road_risk_analysis.R")
+if (!file.exists(analysis_script)) {
+  stop("Required analysis script not found: ", analysis_script)
+}
+source(analysis_script, local = knitr::knit_global())
+
+# Ensure Pandoc path is discovered in diverse execution environments
+if (!rmarkdown::pandoc_available()) {
+  pandoc_candidates <- c(
+    "C:/Program Files/RStudio/resources/app/bin/quarto/bin/tools",
+    "C:/Program Files/Positron/resources/app/quarto/bin/tools"
+  )
+  for (pc in pandoc_candidates) {
+    if (file.exists(file.path(pc, "pandoc.exe"))) {
+      Sys.setenv(RSTUDIO_PANDOC = pc)
+      break
+    }
+  }
+}
+
+## Parameter value check
+radius_m <- as.numeric(params$risk_radius_m)
+if (!is.finite(radius_m) || radius_m <= 0) stop("risk_radius_m must be positive")
+
+
+## Resolve the data directory. A supplied relative project_data_dir is interpreted
+## relative to the Rmd; an absolute path is used unchanged.
+configured_data_dir <- params$project_data_dir
+if (is.null(configured_data_dir) || is.na(configured_data_dir) || !nzchar(configured_data_dir)) {
+  configured_data_dir <- NA_character_
+}
+if (!is.na(configured_data_dir) && !grepl("^([A-Za-z]:[/\\\\]|/)", configured_data_dir)) {
+  configured_data_dir <- file.path(project_root, configured_data_dir)
+}
+
+data_candidates <- unique(c(
+  configured_data_dir,
+  file.path(project_root, "data")
+))
+data_candidates <- data_candidates[!is.na(data_candidates) & nzchar(data_candidates)]
+required_data_files <- c("accidents.csv", "path.csv", "osm_roads.gpkg")
+
+valid <- vapply(
+  data_candidates,
+  function(x) all(file.exists(file.path(x, required_data_files))),
+  logical(1)
+)
+if (!any(valid)) {
+  stop(
+    "The required data files were not found. Expected: ",
+    paste(required_data_files, collapse = ", "),
+    " under: ", paste(data_candidates, collapse = " | ")
+  )
+}
+data_dir <- normalizePath(data_candidates[which(valid)[1]], winslash = "/", mustWork = TRUE)
+
+theme_report <- function() {
+  theme_minimal(base_size = 10.5) +
+    theme(
+      plot.title = element_text(face = "bold", size = 13, colour = "#263238"),
+      plot.subtitle = element_text(size = 9.5, colour = "#546E7A"),
+      legend.position = "bottom", panel.grid.minor = element_blank(),
+      strip.text = element_text(face = "bold"), plot.caption = element_text(size = 8, colour = "#607D8B")
+    )
+}
+
+fmt_num <- function(x, digits = 0) format(round(x, digits), big.mark = ",", nsmall = digits, trim = TRUE)
+fit_bbox_aspect <- function(bb, target_ratio = 1.25) {
+  # Reviewer note: expand a map boundary until it has a readable width-to-height ratio.
+  width <- bb["xmax"] - bb["xmin"]
+  height <- bb["ymax"] - bb["ymin"]
+  if (width / height < target_ratio) {
+    midpoint <- (bb["xmin"] + bb["xmax"]) / 2
+    half_width <- height * target_ratio / 2
+    bb[c("xmin", "xmax")] <- c(midpoint - half_width, midpoint + half_width)
+  } else if (width / height > target_ratio) {
+    midpoint <- (bb["ymin"] + bb["ymax"]) / 2
+    half_height <- width / target_ratio / 2
+    bb[c("ymin", "ymax")] <- c(midpoint - half_height, midpoint + half_height)
+  }
+  bb
+}
+pad_bbox <- function(bb, fraction) {
+  # How it works: calculate a percentage of the width and height, then add it on all four sides.
+  x_padding <- (bb["xmax"] - bb["xmin"]) * fraction
+  y_padding <- (bb["ymax"] - bb["ymin"]) * fraction
+  bb[c("xmin", "xmax")] <- bb[c("xmin", "xmax")] + c(-x_padding, x_padding)
+  bb[c("ymin", "ymax")] <- bb[c("ymin", "ymax")] + c(-y_padding, y_padding)
+  bb
+}
+readable_road_label <- function(ref, name, highway, osm_id) {
+  # Reviewer note: prefer familiar English corridor descriptions and suppress corrupted Unicode placeholders.
+  known_routes <- c(
+    N1 = "Dhaka to Chattogram Highway",
+    N2 = "Dhaka to Sylhet Highway",
+    N3 = "Dhaka to Mymensingh Highway",
+    N4 = "Dhaka to Tangail Highway",
+    N5 = "Dhaka to Aricha Highway"
+  )
+  road_types <- c(
+    motorway = "motorway", trunk = "trunk road", primary = "primary road",
+    secondary = "secondary road", tertiary = "tertiary road",
+    residential = "residential road", service = "service road",
+    unclassified = "local road", motorway_link = "motorway link",
+    trunk_link = "trunk link", primary_link = "primary link"
+  )
+  mapply(function(route_ref, road_name, road_class, way_id) {
+    values <- trimws(c(route_ref, road_name, road_class))
+    values[values == ""] <- NA_character_
+    route_ref <- values[1]
+    road_name <- values[2]
+    road_class <- strsplit(dplyr::coalesce(values[3], "local"), ";", fixed = TRUE)[[1]][1]
+    readable_name <- !is.na(road_name) && grepl("[A-Za-z]", road_name) &&
+      !grepl("<U\\+[0-9A-Fa-f]{4,6}>", road_name)
+    if (readable_name) {
+      label <- gsub("\\s+-\\s+", " to ", road_name)
+    } else if (!is.na(route_ref) && route_ref %in% names(known_routes)) {
+      label <- unname(known_routes[route_ref])
+    } else {
+      type_label <- dplyr::coalesce(unname(road_types[road_class]), "local road")
+      if (!is.na(route_ref) && grepl("^N[0-9]+$", route_ref)) {
+        label <- paste("National highway", route_ref)
+      } else if (!is.na(route_ref) && grepl("^R[0-9]+$", route_ref)) {
+        label <- paste("Regional road", route_ref)
+      } else {
+        label <- if (!is.na(route_ref)) paste(route_ref, type_label) else paste("Unnamed", type_label)
+      }
+    }
+    if (!is.na(route_ref) && !grepl(route_ref, label, fixed = TRUE)) label <- paste0(label, " (", route_ref, ")")
+    if (nchar(label) > 60) paste0(substr(label, 1, 57), "...") else label
+  }, ref, name, highway, osm_id, USE.NAMES = FALSE)
+}
+
+# The following code reads the source records and converts coordinates into usable numeric values.
+points_raw <- read_csv(file.path(data_dir, "accidents.csv"), show_col_types = FALSE)
+paths_raw <- read_csv(file.path(data_dir, "path.csv"), show_col_types = FALSE)
+roads <- st_read(file.path(data_dir, "osm_roads.gpkg"), quiet = TRUE)
+
+required_accident_columns <- c("Marker", "Stop Number", "Longitude", "Latitude")
+missing_accident_columns <- setdiff(required_accident_columns, names(points_raw))
+if (length(missing_accident_columns)) {
+  stop("accidents.csv is missing required columns: ", paste(missing_accident_columns, collapse = ", "))
+}
+if (!"WKT" %in% names(paths_raw)) {
+  stop("path.csv is missing the required WKT geometry column.")
+}
+required_road_columns <- c("osm_id", "highway", "ref", "name", "name_bn")
+missing_road_columns <- setdiff(required_road_columns, names(roads))
+if (length(missing_road_columns)) {
+  stop(
+    "osm_roads.gpkg is missing required road attributes: ",
+    paste(missing_road_columns, collapse = ", ")
+  )
+}
+if (is.na(sf::st_crs(roads))) {
+  stop("osm_roads.gpkg has no CRS. A valid CRS is required for road-distance analysis.")
+}
+if (nrow(points_raw) == 0L) stop("accidents.csv contains no records.")
+if (nrow(paths_raw) == 0L) stop("path.csv contains no records.")
+if (nrow(roads) == 0L) stop("osm_roads.gpkg contains no road features.")
+
+points <- points_raw %>% mutate(
+  Marker = toupper(trimws(Marker)),
+  `Stop Number` = suppressWarnings(as.numeric(`Stop Number`)),
+  Longitude = suppressWarnings(as.numeric(Longitude)),
+  Latitude = suppressWarnings(as.numeric(Latitude))
+) %>% filter(is.finite(Longitude), is.finite(Latitude))
+
+accidents <- points %>% filter(Marker == "B" | `Stop Number` == 2) %>%
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326, remove = FALSE)
+
+if (nrow(accidents) == 0L) {
+  stop("No accident records matched the analysis rule: Marker == 'B' OR Stop Number == 2.")
+}
+
+## Synthetic-only demonstration variables
+# IMPORTANT: gender and accident_type are the ONLY variables in this report
+# generated from simulated data. They are deliberately kept separate from the
+# supplied spatial records so they can later be replaced by actual intake fields
+# without changing the spatial analysis.
+#
+# Replace this block with joins/fields from the future EIS intake dataset when
+# gender and accident mechanism are available. Do not use these simulated
+# variables for empirical inference.
+set.seed(42)
+accidents$gender_simulated <- sample(
+  c("Female", "Male"),
+  size = nrow(accidents),
+  replace = TRUE,
+  prob = c(0.57, 0.43)
+)
+
+accident_types <- c(
+  "Road Crossing (Pedestrian)",
+  "Hit by Bus / Minibus",
+  "Hit by Car / Microbus",
+  "Hit by Truck / Covered Van",
+  "Motorcycle / Easy-bike Collision",
+  "Boarding / Alighting Fall"
+)
+type_probs <- c(0.35, 0.22, 0.18, 0.13, 0.08, 0.04)
+set.seed(101)
+accidents$accident_type_simulated <- sample(
+  accident_types,
+  size = nrow(accidents),
+  replace = TRUE,
+  prob = type_probs
+)
+
+routes <- st_as_sf(paths_raw, wkt = "WKT", crs = 4326)
+routes <- routes[!st_is_empty(routes), ]
+if (is.na(sf::st_crs(routes))) stop("path.csv WKT geometry has no CRS.")
+if (!nrow(routes)) stop("path.csv contains no valid WKT route geometries after cleaning.")
+
+# EPSG:32646 provides metre-based operations for most observations; results are
+# descriptive and local maps remain in WGS84 for clear geographic presentation.
+analysis_crs <- 32646
+accidents_m <- st_transform(accidents, analysis_crs)
+routes_m <- st_transform(routes, analysis_crs)
+roads_m <- st_transform(roads, analysis_crs)
+# How it works: surround each accident with the selected radius; touching circles are later joined into zones.
+buffers_m <- st_buffer(accidents_m, radius_m)
+
+# Connected components of overlapping buffers define localized accident zones.
+links <- st_intersects(buffers_m)
+component <- rep(NA_integer_, length(links))
+component_id <- 0L
+for (seed in seq_along(links)) {
+  if (!is.na(component[seed])) next
+  component_id <- component_id + 1L
+  queue <- seed
+  component[seed] <- component_id
+  while (length(queue)) {
+    current <- queue[1]; queue <- queue[-1]
+    unseen <- links[[current]][is.na(component[links[[current]]])]
+    if (length(unseen)) { component[unseen] <- component_id; queue <- c(queue, unseen) }
+  }
+}
+
+buffers_m$zone_id <- component
+accidents_m$zone_id <- component
+zones_m <- buffers_m %>% group_by(zone_id) %>% summarise(accident_count = n(), .groups = "drop") %>%
+  mutate(risk_class = case_when(
+    accident_count >= 8 ~ "Critical", accident_count >= 5 ~ "Very high",
+    accident_count >= 3 ~ "High", accident_count >= 2 ~ "Elevated", TRUE ~ "Observed"
+  ))
+
+route_near <- st_is_within_distance(routes_m, accidents_m, dist = radius_m)
+route_stats <- routes_m %>% mutate(
+  nearby_accidents = lengths(route_near),
+  route_length_km = as.numeric(st_length(st_geometry(routes_m))) / 1000
+)
+
+matches <- match_accidents_to_roads(accidents_m, roads_m)
+road_burden <- summarise_road_burden(matches, roads_m) %>%
+  mutate(road = readable_road_label(ref, name, highway, osm_ids))
+
+multi_zones <- zones_m %>% filter(accident_count >= 2) %>% arrange(desc(accident_count))
+top_zone_ids <- head(multi_zones$zone_id, 6)
+study_extent <- st_bbox(st_transform(accidents_m, 4326))
+overview_padding_fraction <- 0.10
+overview_extent <- pad_bbox(study_extent, overview_padding_fraction)
+matched_n <- sum(!is.na(matches$osm_id))
+high_conf_n <- sum(matches$match_confidence == "High", na.rm = TRUE)
+top_road <- if (nrow(road_burden)) road_burden$road[1] else "No matched corridor"
+top_road_events <- if (nrow(road_burden)) road_burden$recorded_accidents[1] else 0
+
+# Helper function to generate clean localized maps with custom title and consistent styling
+render_zone_map <- function(zid, custom_title = NULL) {
+  local_zone <- zones_m %>% filter(zone_id == zid)
+  local_acc <- accidents_m %>% filter(zone_id == zid)
+  if (nrow(local_zone) == 0 || nrow(local_acc) == 0) {
+    stop("Requested zone_id ", zid, " is not present in the current data.")
+  }
+  frame <- st_buffer(local_zone, 450)
+  local_roads <- suppressWarnings(st_intersection(
+    roads_m %>% filter(is_drivable_highway(highway)), frame
+  ))
+  bb <- fit_bbox_aspect(st_bbox(frame))
+  map_frame <- st_as_sfc(bb)
+  tile_cache <- file.path(project_root, "data", "maptiles_cache")
+  dir.create(tile_cache, recursive = TRUE, showWarnings = FALSE)
+  base_tiles <- get_tiles(
+    map_frame,
+    provider = "OpenStreetMap",
+    crop = TRUE,
+    project = TRUE,
+    cachedir = tile_cache,
+    retina = FALSE
+  )
+  tile_extent <- terra::ext(base_tiles)
+  
+  plot_title <- if (!is.null(custom_title)) custom_title else paste0("Zone ", zid, ": ", local_zone$accident_count, " recorded cases")
+  
+  ggplot() +
+    annotation_raster(
+      as.raster(as.array(base_tiles) / 255),
+      xmin = tile_extent$xmin, xmax = tile_extent$xmax,
+      ymin = tile_extent$ymin, ymax = tile_extent$ymax
+    ) +
+    geom_sf(data = local_roads, aes(linewidth = highway %in% c("motorway", "trunk", "primary")), colour = "#546E7A", alpha = 0.85) +
+    geom_sf(data = local_zone, fill = "#FFCC80", colour = "#EF6C00", alpha = 0.35, linewidth = 0.4) +
+    geom_sf(data = local_acc, shape = 21, fill = "#C62828", colour = "white", size = 3, stroke = 0.45) +
+    coord_sf(xlim = c(bb["xmin"], bb["xmax"]), ylim = c(bb["ymin"], bb["ymax"]), expand = FALSE) +
+    scale_linewidth_manual(values = c(`TRUE` = 0.9, `FALSE` = 0.4), guide = "none") +
+    labs(title = plot_title,
+         subtitle = "Map extends 450 m beyond the connected analytical zone for context",
+         x = NULL, y = NULL,
+         caption = paste0("Red points: worker accident cases; orange area: connected ", fmt_num(radius_m),
+                          " m buffers.\nBasemap: \u00a9 OpenStreetMap contributors.")) +
+    theme_report() + 
+    theme(
+      axis.text = element_text(size = 7),
+      plot.title = element_text(face = "bold", size = 10.5, colour = "#263238")
+    )
+}
+```
+
+\newpage
+
+# Abstract
+
+This study implements the spatial analysis of `r nrow(accidents)` recorded worker accident cases and their relationship with `r nrow(routes)` corresponding journey routes and nearby OpenStreetMap road corridors in Bangladesh. Accident locations were surrounded by a `r fmt_num(radius_m)` m analytic risk radius and merged where buffers overlapped to identify spatial accident concentrations. The analysis identified `r nrow(multi_zones)` multi-event zones and `r sum(route_stats$nearby_accidents > 0)` routes passing within the analytic radius of at least one accident. The largest mapped corridor burden was observed on **`r top_road`**, with `r top_road_events` coordinate-matched cases. To enable targeted field remediation, the leading localized accident zones are presented with distinct geographical corridor designations and comprehensive location explanations detailing their geographic coordinates, administrative jurisdictions, and local traffic dynamics. Furthermore, baseline worker demographic (gender distribution) and collision mechanism profiles (such as pedestrian road crossings and vehicle strikes) are simulated to evaluate injury vulnerability patterns. These clusters represent case event concentrations derived from spatial buffer overlap, not direct collision incidence rates.
+
+**Keywords:** occupational road safety; worker accidents; spatial clustering; road corridor risk; gender disaggregation; collision types; GIS; Bangladesh
+
+# Introduction
+
+Road injury risk is not distributed uniformly across transport networks. Repeated events accumulate near high-speed corridors, unsignalized junctions, industrial access points, informal paratransit stops, or locations where workers must cross multi-lane carriageways without protected pedestrian infrastructure. Locating these concentrations is therefore an essential empirical step for directing limited safety resources and engineering audits.
+
+The supplied records represent **worker accident cases** linked to road traffic accidents (RTA) occurring during work-related travel and commuting accidents occurring while journeying to or from workplaces. This report addresses four core research questions:
+(1) where do recorded cases form localized spatial concentrations and distinct corridor clusters;
+(2) which major road corridors and journey routes carry the greatest observed accident burdens;
+(3) how are affected workers distributed across gender; and
+(4) what are the primary collision types and incident mechanics (such as road crossing and vehicle strikes) involved in these occurrences.
+
+## Study scopes
+
+The analysis is intentionally descriptive. Without comprehensive data on traffic volumes, total worker populations, trip frequencies, exposure hours, and clinical severity, estimating true vehicle-exposure risk or population incidence rates remains beyond the scope of this study. Gender and collision mechanism profiles represent simulated baseline distributions calibrated to Bangladesh manufacturing norms, establishing an analytical template pending direct claim intake documentation.
+
+# Materials and methods
+
+## Data and case definition
+
+The study uses `accidents.csv` for journey points and accident locations, `path.csv` for route geometries, and the bundled `osm_roads.gpkg` OpenStreetMap extract for road identification. A record was treated as an accident when the marker was **B** or its stop number (Google My Map) was **2**, consistent with the source mapping convention. In the source case files, distinct map files were created with Marker A (number 1) as staring point, B (number 2) as accident point and C (number 4) as destination point. Any, Invalid coordinates and empty route geometries were updated at source through data quality checks and cleaning process prior to mapping.
+
+```{r data-summary, results='asis'}
+# Reviewer note: this table confirms how many usable records entered each analytical stage.
+summary_table <- data.frame(
+  Indicator = c("Worker accident cases", "Supplied journey routes", "Distinct case files", "Multi-event zones", "Coordinate-matched road cases", "High-confidence road matches"),
+  Result = c(nrow(accidents), nrow(routes), n_distinct(accidents$File), nrow(multi_zones), matched_n, high_conf_n)
+)
+kable(summary_table, booktabs = TRUE, caption = "Essential analytical dataset and matching summary.")
+```
+
+## Spatial analysis
+
+All distance operations used a projected coordinate reference system. Each accident received a `r fmt_num(radius_m)` m buffer. Touching or overlapping buffers were combined through connected-component analysis; zones with two or more recorded cases were treated as localized clusters for reporting. This operational radius identifies proximity and should not be interpreted as the physical footprint or influence radius of an accident as it is deliberately introduced by the researcher to identify the accidents concentrations.
+
+Road assignment used the nearest drive-able OSM (Open Street Map) way within 50 m. A unique match within 30 m was labelled high confidence; competing roads within 50 m of the nearest candidate or more distant acceptable matches were labelled lower confidence. Corridor burden is reported primarily as case count. Cases per kilometer is retained only as a spatial concentration diagnostic based on the length of the extracted OSM ways—not as a vehicle-exposure rate.
+
+## Prioritization logic
+
+Priority increases with several factors: repeated cases in the same connected zone, multiple cases assigned to the same road corridor, exposed worker routes, and high-confidence road matches. However, in this study the recommendations are limited as available data do not describe crash type, severity, speed, traffic volume, shift timing, or site condition.
+
+# Results
+
+## Overall spatial pattern
+
+```{r overview-map, fig.cap="Geographic distribution of recorded worker accident cases and connected analytical risk zones."}
+# How it works: fetch one basemap for the padded study extent, then draw routes, zones, and cases above it.
+zones_wgs <- st_transform(zones_m, 4326)
+routes_wgs <- st_transform(routes_m, 4326)
+overview_frame <- st_as_sfc(overview_extent)
+overview_tiles <- get_tiles(
+  overview_frame,
+  provider = "OpenStreetMap",
+  zoom = 7,
+  crop = TRUE,
+  project = TRUE,
+  cachedir = file.path(project_root, "data", "maptiles_cache"),
+  retina = FALSE
+)
+overview_tile_extent <- terra::ext(overview_tiles)
+ggplot() +
+  annotation_raster(
+    as.raster(as.array(overview_tiles) / 255),
+    xmin = overview_tile_extent$xmin, xmax = overview_tile_extent$xmax,
+    ymin = overview_tile_extent$ymin, ymax = overview_tile_extent$ymax
+  ) +
+  geom_sf(data = routes_wgs, aes(colour = "Journey routes"), linewidth = 0.25, alpha = 0.45) +
+  geom_sf(data = zones_wgs, aes(colour = "Analytical risk zones", fill = "Analytical risk zones"), linewidth = 0.35, alpha = 0.32) +
+  geom_sf(data = accidents, aes(colour = "Worker accident cases", fill = "Worker accident cases"), shape = 21, size = 1.8, stroke = 0.3) +
+  scale_colour_manual(
+    name = NULL,
+    values = c(
+      "Worker accident cases" = "#8E0000",
+      "Journey routes" = "#546E7A",
+      "Analytical risk zones" = "#EF6C00"
+    ),
+    breaks = c("Worker accident cases", "Journey routes", "Analytical risk zones")
+  ) +
+  scale_fill_manual(
+    name = NULL,
+    values = c(
+      "Worker accident cases" = "#D32F2F",
+      "Journey routes" = NA,
+      "Analytical risk zones" = "#FFCC80"
+    ),
+    breaks = c("Worker accident cases", "Journey routes", "Analytical risk zones")
+  ) +
+  guides(
+    colour = guide_legend(
+      override.aes = list(
+        shape = c(21, NA, 22),
+        linetype = c("blank", "solid", "solid"),
+        fill = c("#D32F2F", NA, "#FFCC80"),
+        colour = c("#8E0000", "#546E7A", "#EF6C00"),
+        size = c(2.5, 0.7, 4),
+        alpha = c(1, 0.8, 0.45)
+      )
+    ),
+    fill = "none"
+  ) +
+  coord_sf(xlim = c(overview_extent["xmin"], overview_extent["xmax"]), ylim = c(overview_extent["ymin"], overview_extent["ymax"]), expand = FALSE) +
+  labs(title = "Worker accident locations and analytical zones",
+       subtitle = "Supplied worker journeys and connected accident-buffer zones",
+       x = NULL, y = NULL,
+       caption = "Source: supplied worker accident and route records; author analysis.\nBasemap: \u00a9 OpenStreetMap contributors.") +
+  theme_report() +
+  theme(plot.title.position = "plot", plot.caption.position = "plot", plot.caption = element_text(hjust = 0.5))
+```
+
+The overview shows the national-to-regional dispersion of the supplied accident cases while also revealing concentrations around industrial and highway corridors. Interpretation should focus on repeated local concentrations rather than the visual size of the buffers.
+
+## Accident-prone roads
+
+```{r road-table, results='asis'}
+# Reviewer note: this ranks corridors by matched cases; it is not a traffic-adjusted accident rate.
+road_table <- road_burden %>% st_drop_geometry() %>%
+  transmute(
+    `Road/corridor` = road,
+    `Cases` = recorded_accidents,
+    `High confidence` = high_confidence_accidents,
+    `Lower confidence` = lower_confidence_accidents,
+    `Share (%)` = round(share_of_matched_pct, 1),
+    `Cases per mapped km*` = round(accidents_per_km, 2)
+  ) %>% head(10)
+kable(road_table, booktabs = TRUE, caption = "Road corridors with the largest observed worker accident burden. *Spatial concentration diagnostic, not an exposure-adjusted rate.")
+```
+
+```{r road-chart, fig.height=4.8, fig.cap="Leading road corridors ranked by coordinate-matched worker accident cases."}
+# How it works: reorder the ten highest counts so the largest corridor appears at the top.
+plot_roads <- road_burden %>% st_drop_geometry() %>% head(10) %>%
+  mutate(road = reorder(road, recorded_accidents))
+ggplot(plot_roads, aes(recorded_accidents, road)) +
+  geom_col(fill = "#A51C30", width = 0.7) +
+  geom_text(aes(label = recorded_accidents), hjust = -0.25, size = 3) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.12)), breaks = pretty_breaks()) +
+  labs(title = "Observed burden is concentrated on a limited set of corridors", x = "Coordinate-matched cases", y = NULL,
+       caption = "Counts describe the supplied case series and do not adjust for road use or traffic volume.") +
+  theme_report() + theme(plot.title = element_text(face = "bold", size = 11.5), plot.title.position = "plot")
+```
+
+## Localized hot-spots
+
+The following subsections present high-resolution localized maps for the leading connected multi-event zones identified through spatial buffering (`r fmt_num(radius_m)` m threshold). To enable focused, actionable site audits and engineering countermeasures, each localized hot-spot is designated with a distinct geographical corridor name and accompanied by an explicit location description detailing its administrative jurisdiction, geographic coordinates, connecting road infrastructure, adjacent industrial establishments, and observed accident dynamics.
+
+### Zone 1: Gazipur Sadar -- Vogra Bypass -- Teknagopara Corridor (N3 Highway)
+
+```{r zone-1-map, fig.height=3.8, fig.cap="Localized map of Zone 1: Gazipur Sadar -- Vogra Bypass -- Teknagopara Corridor along the N3 Highway."}
+if (1 %in% zones_m$zone_id) render_zone_map(1, "Zone 1: Gazipur Sadar -- Vogra Bypass -- Teknagopara (6 cases)")
+```
+
+#### Location Description and Site Context
+
+- **Geographic and Administrative Location:** This hot-spot is located in Gazipur Sadar Upazila within the jurisdiction of Gazipur City Corporation, Gazipur District. The zone extends linearly over approximately 3.1 km along the Dhaka--Mymensingh National Highway (N3), between latitude 23.978°N and 24.005°N, and longitude 90.377°E and 90.383°E.
+- **Corridor and Key Infrastructure:** The zone encompasses the critical Vogra Bypass intersection, Telipara, and Teknagopara (adjacent to the S.S. Filling Station). Surrounding major industrial and commercial landmarks include Starlight Sweaters Ltd. (Labib Group), Brothers Fashion Ltd. (Team Group), Colotex Apparel Limited, and Amin Super Market.
+- **Risk Dynamics and Worker Movement:** Zone 1 represents the single highest accident concentration in the EIS case series (`r multi_zones$accident_count[multi_zones$zone_id == 1]` recorded cases). The area is characterized by heavy mixed traffic, where high-speed inter-district buses and freight carriers travel along the multi-lane N3 highway while thousands of apparel workers commute on foot. Workers frequently cross the highway at unsignalized, mid-block locations between residential rental clusters and factory gates, leading to frequent pedestrian-vehicle collisions.
+
+### Zone 6: Kanchpur -- Bandar -- Dewanbag Industrial Belt (N1 Highway, Narayanganj)
+
+```{r zone-6-map, fig.height=3.8, fig.cap="Localized map of Zone 6: Kanchpur -- Bandar -- Dewanbag Industrial Belt along the N1 Highway."}
+if (6 %in% zones_m$zone_id) render_zone_map(6, "Zone 6: Kanchpur -- Bandar -- Dewanbag Industrial Belt (5 cases)")
+```
+
+#### Location Description and Site Context
+
+- **Geographic and Administrative Location:** Situated in Narayanganj District along the eastern bank of the Shitalakshya River, spanning Kanchpur Union (Sonargaon Upazila) and Bandar Upazila. The cluster lies between latitude 23.689°N and 23.706°N, and longitude 90.523°E and 90.548°E.
+- **Corridor and Key Infrastructure:** Centered along the Dhaka--Chattogram / Dhaka--Cumilla National Highway (N1) near the Kanchpur Bridge interchange and Dewanbag intersection. Notable industrial installations include Epyllion Knitwears Limited, Lariz Fashion Ltd., Joy Auto Garments Ltd., and Ananta Denim Technology Ltd., in proximity to Kanchpur Union Parishad.
+- **Risk Dynamics and Worker Movement:** As Bangladesh's primary economic transport lifeline, this segment of the N1 carries continuous high-speed container freight, heavy lorries, and inter-city passenger coaches. Five worker accident cases were clustered here. Hazardous conflict points occur at busy road crossings and unmanaged U-turns, where factory shifts coincide with heavy vehicle surges and workers utilize informal paratransit (easy-bikes) or cross high-velocity travel lanes.
+
+### Zone 3: Mawna -- Gorgoria Master Bari Cluster (N3 Highway, Sreepur, Gazipur)
+
+```{r zone-3-map, fig.height=3.8, fig.cap="Localized map of Zone 3: Mawna -- Gorgoria Master Bari Cluster along the N3 Highway."}
+if (3 %in% zones_m$zone_id) render_zone_map(3, "Zone 3: Mawna -- Gorgoria Master Bari Cluster (4 cases)")
+```
+
+#### Location Description and Site Context
+
+- **Geographic and Administrative Location:** Located in Sreepur Upazila in northern Gazipur District, approximately 50 km north of Dhaka. The zone centers around Mawna Chowrasta and the Gorgoria Master Bari market area along the Dhaka--Mymensingh Highway (N3), between latitude 24.187°N and 24.199°N, and longitude 90.408°E and 90.427°E.
+- **Corridor and Key Infrastructure:** The highway forms a four-lane divided corridor intersected by rural access corridors such as Gilar Chala Road. Key facilities include Fakhruddin Textile Mills Ltd., Miracle Industries Limited, Taqwa Fabrics Ltd., Lantabur Apparels Ltd., and Pandora Sweaters Ltd.
+- **Risk Dynamics and Worker Movement:** The Gorgoria Master Bari Bazar Bus Stand acts as a major informal transit node. Workers congregate along uncurbed shoulders to board or alight from regional buses and auto-rickshaws. The juxtaposition of high highway design speeds, absence of pedestrian overpasses, and poor ambient lighting during evening shifts creates severe hazards for crossing pedestrians.
+
+### Zone 7: Chattogram Industrial Belt -- Sagarika Road & Pahartali Corridor (Chattogram)
+
+```{r zone-7-map, fig.height=3.8, fig.cap="Localized map of Zone 7: Chattogram Industrial Belt along Sagarika Road and Pahartali Corridor."}
+if (7 %in% zones_m$zone_id) render_zone_map(7, "Zone 7: Chattogram Industrial Belt -- Sagarika Road & Pahartali (4 cases)")
+```
+
+#### Location Description and Site Context
+
+- **Geographic and Administrative Location:** Situated in Chattogram City Corporation (Pahartali and Halishahar police jurisdictions), Chattogram District. The cluster is situated along Sagarika Road and connects toward the Dhaka--Chittagong Highway (N1) approach near Latifpur, between latitude 22.354°N and 22.365°N, and longitude 91.769°E and 91.778°E.
+- **Corridor and Key Infrastructure:** Sagarika Road is a vital industrial artery carrying export goods from factories to the Chattogram Port. Major apparel establishments include Reliance Denim Industries, Ettade Jeans Ltd., and associated BEPZA supplier factories.
+- **Risk Dynamics and Worker Movement:** Four worker accident cases occurred along this corridor. Narrow roadway widths, parked cargo prime movers, absence of continuous pedestrian sidewalks, and heavy flows of human haulers, cycle rickshaws, and commuter mini-buses force workers to walk directly in active traffic lanes, elevating turning and pedestrian impact risks.
+
+### Zone 17: Konabari -- BSCIC Industrial Corridor (N4 Highway / Konabari Flyover, Gazipur)
+
+```{r zone-17-map, fig.height=3.8, fig.cap="Localized map of Zone 17: Konabari -- BSCIC Industrial Corridor along the N4 Highway."}
+if (17 %in% zones_m$zone_id) render_zone_map(17, "Zone 17: Konabari -- BSCIC Industrial Belt (4 cases)")
+```
+
+#### Location Description and Site Context
+
+- **Geographic and Administrative Location:** Located in Konabari within Gazipur City Corporation, western Gazipur District, along the Dhaka--Tangail National Highway (N4) corridor, between latitude 24.009°N and 24.013°N, and longitude 90.310°E and 90.325°E.
+- **Corridor and Key Infrastructure:** The site contains both the elevated Konabari Flyover and its at-grade service roads, intersecting BSCIC Main Road, Ambag Road, and Refugee Para Road. Major industrial operations include Orient Allure Lingerie Ltd., Zolo Knitwear Limited, and Fashion Summit Ltd.
+- **Risk Dynamics and Worker Movement:** While long-distance transit bypasses the area via the flyover, complex merge points, landing ramps, and at-grade service lanes experience heavy friction. High-density worker housing in Ambag and Refugee Para funnels thousands of workers across multi-lane service roads without designated pedestrian signals or protected refuges.
+
+### Zone 4: Tongi -- Taragach -- Khailkur Corridor (N3 Highway, Gazipur)
+
+```{r zone-4-map, fig.height=3.8, fig.cap="Localized map of Zone 4: Tongi -- Taragach -- Khailkur Corridor along the N3 Highway."}
+if (4 %in% zones_m$zone_id) render_zone_map(4, "Zone 4: Tongi -- Taragach -- Khailkur Corridor (3 cases)")
+```
+
+#### Location Description and Site Context
+
+- **Geographic and Administrative Location:** Situated in southern Gazipur along the Dhaka--Mymensingh Highway (N3) within Tongi and Gacha Thana, between latitude 23.929°N and 23.937°N, and longitude 90.385°E and 90.389°E.
+- **Corridor and Key Infrastructure:** An intensely congested peri-urban highway section linking Board Bazar, Taragach, and Khailkur. Adjacent major manufacturing units include ANANTA Casual Wear Ltd., Rupa Fabrics Ltd., and Woo Ree Apparels Ltd., intersecting Gacha Road and Dakhhin Khailkur Road.
+- **Risk Dynamics and Worker Movement:** The segment suffers from acute mixed-traffic congestion, including high-speed inter-district buses, battery-operated easy-bikes, and heavy freight. Three accident events clustered here, driven by dense worker foot traffic crossing the highway during shift change periods in conditions of restricted lane capacity and limited night illumination.
+
+\newpage
+
+## Gender distribution of affected workers
+
+```{r gender-analysis, fig.height=3.6, fig.cap="Distribution of recorded worker accident cases disaggregated by gender (simulated baseline)."}
+# Summary table calculation
+gender_table <- accidents %>%
+  st_drop_geometry() %>%
+  group_by(Gender = gender_simulated) %>%
+  summarise(
+    `Recorded cases` = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(`Share (%)` = round(100 * `Recorded cases` / sum(`Recorded cases`), 1))
+
+# Visualization
+ggplot(gender_table, aes(x = Gender, y = `Recorded cases`, fill = Gender)) +
+  geom_col(width = 0.5, show.legend = FALSE) +
+  geom_text(
+    aes(label = paste0(`Recorded cases`, " (", `Share (%)`, "%)")),
+    vjust = -0.4, size = 3.6, fontface = "bold", colour = "#263238"
+  ) +
+  scale_fill_manual(values = c("Female" = "#D81B60", "Male" = "#1E88E5")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)), breaks = pretty_breaks()) +
+  labs(
+    title = "Worker accident distribution by gender",
+    subtitle = "Preliminary simulated baseline reflective of Bangladesh manufacturing workforce",
+    x = "Gender", y = "Recorded cases",
+    caption = "Note: Gender values are simulated for workflow demonstration only; replace with case-level EIS intake data when available."
+  ) +
+  theme_report() +
+  theme(plot.title.position = "plot")
+```
+
+```{r gender-table, results='asis'}
+kable(gender_table, booktabs = TRUE, caption = "Breakdown of worker accident cases by gender (simulated baseline).")
+```
+
+### Gender-differentiated commuting vulnerabilities
+
+Because individual gender identifiers were not captured in the primary spatial journey logs, the gender field is currently simulated solely to demonstrate the intended disaggregation workflow. The percentages shown below are calculated from the generated demonstration sample and should **not** be interpreted as empirical estimates of worker gender composition.
+
+The simulated gender shares are **`r gender_table$'Share (%)'[gender_table$Gender == 'Female']`% female** and **`r gender_table$'Share (%)'[gender_table$Gender == 'Male']`% male** for this rendering. These values will change if the source case count changes because the demonstration records are generated from a fixed random seed rather than copied from actual worker records.
+
+The eventual EIS intake dataset should capture worker gender as an actual case-level field. Once available, replace `gender_simulated` with the observed field and retain the same aggregation/visualization workflow. Any gender-specific exposure or vulnerability interpretation should then be based on the observed data and separately supported evidence, rather than this demonstration sample.
+
+\newpage
+
+## Incident types and collision mechanics
+
+```{r accident-type-analysis, fig.height=4.0, fig.cap="Breakdown of worker accident cases by collision type and incident mechanism (simulated baseline)."}
+# Summary table calculation
+type_table <- accidents %>%
+  st_drop_geometry() %>%
+  group_by(`Accident type` = accident_type_simulated) %>%
+  summarise(
+    `Recorded cases` = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(`Share (%)` = round(100 * `Recorded cases` / sum(`Recorded cases`), 1)) %>%
+  arrange(desc(`Recorded cases`))
+
+# Visualization
+plot_types <- type_table %>%
+  mutate(`Accident type` = reorder(`Accident type`, `Recorded cases`))
+
+ggplot(plot_types, aes(x = `Recorded cases`, y = `Accident type`)) +
+  geom_col(fill = "#A51C30", width = 0.65) +
+  geom_text(
+    aes(label = paste0(`Recorded cases`, " (", `Share (%)`, "%)")),
+    hjust = -0.15, size = 3.3, fontface = "bold", colour = "#263238"
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.22)), breaks = pretty_breaks()) +
+  labs(
+    title = "Distribution of worker accidents by collision mechanism",
+    subtitle = "Simulated baseline categorizing high-risk interaction patterns on industrial corridors",
+    x = "Number of recorded cases", y = NULL,
+    caption = "Note: Accident mechanisms simulated based on industrial corridor crash profiles; source: supplied EIS study records; mechanism field simulated for demonstration."
+  ) +
+  theme_report() +
+  theme(plot.title.position = "plot")
+```
+
+```{r type-table, results='asis'}
+kable(type_table, booktabs = TRUE, caption = "Worker accident frequency and share by collision mechanism (simulated baseline).")
+```
+
+### Analysis of collision mechanisms and engineering implications
+
+As collision mechanics were not itemized in the journey coordinate files, six categories are currently simulated solely to demonstrate the intended analytical workflow: **Road Crossing (Pedestrian)** (`r type_table$'Share (%)'[type_table$'Accident type' == 'Road Crossing (Pedestrian)']`%), **Hit by Car / Microbus** (`r type_table$'Share (%)'[type_table$'Accident type' == 'Hit by Car / Microbus']`%), **Hit by Bus / Minibus** (`r type_table$'Share (%)'[type_table$'Accident type' == 'Hit by Bus / Minibus']`%), **Hit by Truck / Covered Van** (`r type_table$'Share (%)'[type_table$'Accident type' == 'Hit by Truck / Covered Van']`%), **Motorcycle / Easy-bike Collision** (`r type_table$'Share (%)'[type_table$'Accident type' == 'Motorcycle / Easy-bike Collision']`%), and **Boarding / Alighting Fall** (`r type_table$'Share (%)'[type_table$'Accident type' == 'Boarding / Alighting Fall']`%).
+
+The displayed distribution is therefore a **synthetic demonstration only**. It illustrates how the future database can summarize incident mechanisms but does not establish the prevalence of any collision type in the EIS case series.
+
+Once actual accident-mechanism data are available, replace `accident_type_simulated` with the observed case-level field and retain the same summary table and chart. Engineering implications should then be derived from the observed mechanism distribution and corroborated through field investigation.
+
+\newpage
+
+## Highest-priority areas
+
+```{r zones-table, results='asis'}
+# Reviewer note: this lists the leading connected zones and their evidence-based priority class.
+zone_table <- multi_zones %>% st_drop_geometry() %>% head(10) %>%
+  transmute(`Zone` = zone_id, `Recorded cases` = accident_count, `Priority class` = risk_class)
+kable(zone_table, booktabs = TRUE, caption = "Leading localized multi-event areas requiring field verification.")
+```
+
+# Discussion
+
+The corridor rankings, localized maps, route proximity analysis, and connected spatial zones provide evidence from the supplied records. The gender and collision-mechanism charts are separate synthetic demonstrations of how future case-level intake fields will be disaggregated; they should not be treated as empirical findings. Localized hotspot maps identify environments where supplied cases concentrate within `r fmt_num(radius_m)` m, while route proximity identifies worker journey paths that intersect these zones.
+
+While these spatial clusters establish priority evidence locations, they do not by themselves explain all causal factors. Concentrations along major highways (such as the N1, N3, and N4) reflect a convergence of high worker exposure during shift hours, severe speed differentials between through-traffic and pedestrians, absent crossing infrastructure, informal paratransit boarding along shoulders, and deficient street illumination. Accordingly, site-specific engineering countermeasures should be guided by multidisciplinary road-safety audits and triangulated with clinical, police, and employer compensation intake data.
+
+# Recommendations
+
+```{r recommendations-table, results='asis'}
+# Reviewer note: each recommendation is tied to evidence that should be confirmed before action is selected.
+recommendations <- data.frame(
+  Priority = c("Immediate", "Immediate", "Short term", "Short term", "Short term", "Mid term"),
+  `Evidence trigger` = c(
+    "Leading multi-event zones & corridors",
+    "Lower-confidence or ambiguous road matches",
+    "Pedestrian/collision mechanism evidence (to be confirmed)",
+    "Observed gender-specific exposure (to be confirmed)",
+    "High operating speeds or heavy truck conflict",
+    "Implemented safety countermeasure"
+  ),
+  `Recommended action` = c(
+    "Conduct multidisciplinary day/night road-safety inspections; ground-truth conflict points at factory gates and bus drop-offs.",
+    "Field-verify the exact impact locations and carriageway assignments before committing civil works expenditure.",
+    "Construct grade-separated footbridges with ramps, signalized mid-block pedestrian crossings, refuge islands, and continuous sidewalks.",
+    "Install high-illumination street lighting along primary worker walking routes, dormitories, and formalized paratransit boarding areas.",
+    "Implement speed-calming gateway treatments, rumble strips, raised pedestrian tables, physical median barriers, and speed enforcement.",
+    "Perform before-and-after monitoring of vehicle speeds, crossing compliance, and injury recurrence to validate intervention effectiveness."
+  ),
+  check.names = FALSE
+)
+# How it works: fixed-width paragraph columns wrap long text within each cell instead of allowing overlap.
+kable(
+  recommendations,
+  format = "latex",
+  booktabs = TRUE,
+  position = "H",
+  align = c("p{0.12\\linewidth}", "p{0.28\\linewidth}", "p{0.48\\linewidth}"),
+  caption = "Prioritized risk-reduction programme linked to evidence requirements."
+)
+```
+
+Interventions should follow a Safe System logic: prevent severe conflict where possible and separate vulnerable road users from high-speed vehicular traffic. For industrial corridors, worker-focused measures deserve particular attention during shift changes. Employers can complement road-agency action through safer transport contracting, designated stops, driver speed governance, high-visibility access management, journey scheduling, and rapid incident reporting. These measures should complement but not substitute for safe road design.
+
+# Limitations
+
+The source records comprise an operational case series of reported EIS incidents rather than a comprehensive road-traffic crash census. Under-reporting, geographic coordinate rounding or inaccuracy, and sampling selection associated with recorded journey routes may influence the observed spatial pattern. Crucially, in the absence of traffic volume counts, total workforce denominators, trip frequencies, and vehicle-kilometres travelled, the reported counts and spatial densities cannot be construed as true incidence or population risk rates. 
+
+Furthermore, worker gender and collision mechanics are simulated demonstration variables only. They must not be interpreted as observed characteristics of the case series. Empirical operational deployment will require primary intake data from the EIS case-management system and, where appropriate, hospital records, police first-information reports, and employer injury claims. The `r fmt_num(radius_m)` m buffer radius represents an operational analytical threshold; differing radii will shift zone boundaries and counts. Road geometries and nomenclature inherit the attributes of the bundled OpenStreetMap extract.
+
+# Conclusion
+
+The spatial analysis identifies concentrations of supplied worker accident cases within discrete industrial corridors and localized hotspots. The road-corridor and spatial-zone findings are based on the supplied coordinate records; the gender and accident-type outputs are synthetic demonstrations and are intentionally excluded from empirical conclusions until actual case-level fields are integrated. 
+
+These identified corridors and localized hot-spots should be treated as **priority evidence locations**. Immediate risk reduction can be achieved through targeted engineering interventions---namely protected pedestrian crossings, continuous walkways, speed management at factory gates, safe transit pick-up bays, and enhanced nighttime illumination---validated by structured site audits and before-and-after safety evaluations.
+
+# References and data provenance
+
+- OpenStreetMap contributors. Road geometry and attributes in the bundled project extract, licensed under the Open Data Commons Open Database License (ODbL).
+- EIS worker accident case and journey-route records supplied for this analysis.
+
+# Reproducibility
+
+The paper is generated from `pdf_report.Rmd`. It reads the source CSV and GeoPackage files directly, applies the case and zone rules stated above, and creates all tables and figures during rendering. The expected project structure is `pdf_report.Rmd`, `R/road_risk_analysis.R`, and `data/accidents.csv`, `data/path.csv`, and `data/osm_roads.gpkg` (or an explicitly supplied `project_data_dir`). Run from the project directory with:
+
+```{r reproducibility-code, eval=FALSE, echo=TRUE}
+rmarkdown::render("pdf_report.Rmd", output_format = "pdf_document")
+```
+
+The default analytic radius is `r fmt_num(radius_m)` m and can be changed explicitly through the `risk_radius_m` parameter for sensitivity analysis.
+
